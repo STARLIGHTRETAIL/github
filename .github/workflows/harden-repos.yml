@@ -30,10 +30,25 @@ jobs:
 
       - name: Validate admin token
         run: |
+          echo "Validating ORG_ADMIN_PAT permissions..."
+
+          # Check org access
           gh api /orgs/${ORG} --jq '.login' || {
             echo "ERROR: ORG_ADMIN_PAT secret is missing or lacks org admin scope."
             exit 1
           }
+
+          # Verify token has required scopes (repo and admin:org)
+          scopes=$(gh api /user -i 2>&1 | grep -i "x-oauth-scopes:" | cut -d: -f2- | tr -d ' ')
+          echo "Token scopes: ${scopes}"
+
+          if [[ ! "${scopes}" =~ "repo" ]] || [[ ! "${scopes}" =~ "admin:org" ]]; then
+            echo "ERROR: ORG_ADMIN_PAT must have 'repo' and 'admin:org' scopes"
+            echo "Current scopes: ${scopes}"
+            exit 1
+          fi
+
+          echo "✓ Token validation successful"
 
       - name: List current public repositories
         id: list_public
@@ -51,39 +66,71 @@ jobs:
       - name: Convert public repositories to private
         run: |
           echo "=== Converting public repositories to private (dry_run=${DRY_RUN}) ==="
+
+          total=$(wc -l < /tmp/public_repos.txt)
+          count=0
           success_count=0
+          skipped_count=0
           error_count=0
 
           while IFS= read -r repo; do
+            ((count++))
             repo_name="${repo#${ORG}/}"
 
             # The .github repo should remain public (it is the org profile repo)
             if [ "${repo_name}" = ".github" ]; then
-              echo "SKIP: ${repo} — keeping public (org profile repo)"
+              echo "[${count}/${total}] SKIP: ${repo} — keeping public (org profile repo)"
+              ((skipped_count++))
               continue
             fi
 
             if [ "${DRY_RUN}" = "true" ]; then
-              echo "DRY-RUN: Would set ${repo} to private"
-              success_count=$((success_count + 1))
+              echo "[${count}/${total}] DRY-RUN: Would set ${repo} to private"
+              ((success_count++))
             else
-              echo "Setting ${repo} to private..."
-              if gh api \
-                --method PATCH \
-                "/repos/${repo}" \
-                --field private=true \
-                --field visibility=private \
-                --jq '"  → " + .full_name + " is now " + .visibility'; then
-                success_count=$((success_count + 1))
-              else
-                echo "  ERROR: Failed to privatize ${repo}"
-                error_count=$((error_count + 1))
+              echo "[${count}/${total}] Setting ${repo} to private..."
+
+              # Retry logic: attempt up to 3 times with exponential backoff
+              retry=0
+              max_retries=3
+              success=false
+
+              while [ ${retry} -lt ${max_retries} ]; do
+                if gh api \
+                  --method PATCH \
+                  "/repos/${repo}" \
+                  --field private=true \
+                  --field visibility=private \
+                  --jq '"  ✓ " + .full_name + " is now " + .visibility' 2>/dev/null; then
+                  ((success_count++))
+                  success=true
+                  break
+                else
+                  ((retry++))
+                  if [ ${retry} -lt ${max_retries} ]; then
+                    sleep_time=$((2 ** retry))
+                    echo "  ⚠ Retry ${retry}/${max_retries} after ${sleep_time}s..."
+                    sleep ${sleep_time}
+                  fi
+                fi
+              done
+
+              if [ "${success}" = "false" ]; then
+                echo "  ✗ Failed to privatize ${repo} after ${max_retries} attempts"
+                ((error_count++))
               fi
             fi
           done < /tmp/public_repos.txt
-          
+
+          # Summary statistics
           echo ""
-          echo "Summary: ${success_count} repositories processed, ${error_count} errors"
+          echo "=== Conversion Summary ==="
+          echo "Total repos: ${total}"
+          echo "Successfully converted: ${success_count}"
+          echo "Skipped: ${skipped_count}"
+          [ ${error_count} -gt 0 ] && echo "Failed: ${error_count}"
+
+          # Fail the workflow if any repos failed to convert
           [ "${error_count}" -gt 0 ] && exit 1 || true
 
       - name: Create STARLIGHTRETAIL/.github if it does not exist
@@ -110,36 +157,49 @@ jobs:
         run: |
           if [ "${DRY_RUN}" = "true" ]; then
             echo "DRY-RUN: Would push profile/README.md to ${ORG}/.github"
-            cat profile/README.md
+            echo "--- Content preview (first 10 lines) ---"
+            head -n 10 profile/README.md
           else
             echo "Pushing profile/README.md to ${ORG}/.github..."
 
             # Fetch existing SHA if the file already exists (required for updates)
             if existing_sha=$(gh api "/repos/${ORG}/.github/contents/profile/README.md" \
                 --jq '.sha' 2>/dev/null); then
-              echo "File exists, will update (SHA: ${existing_sha})"
+              echo "  → File exists (sha: ${existing_sha:0:7}...), updating..."
+              message='chore: update public org profile README'
             else
-              echo "File does not exist, will create new file"
+              echo "  → File does not exist, creating..."
               existing_sha=""
+              message='chore: add public org profile README'
             fi
 
-            content=$(base64 < profile/README.md | tr -d '
+            # Encode content (remove newlines for portability)
+            content=$(base64 < profile/README.md | tr -d '\n')
 
+            # Single PUT operation with conditional SHA
             if [ -n "${existing_sha}" ]; then
-              gh api \
+              result=$(gh api \
                 --method PUT \
                 "/repos/${ORG}/.github/contents/profile/README.md" \
-                --field message='chore: update public org profile README' \
+                --field message="${message}" \
                 --field content="${content}" \
-                --field sha="${existing_sha}" \
-                --jq '"Updated: " + .content.path + " (sha: " + .content.sha + ")"'
+                --field sha="${existing_sha}" 2>&1)
             else
-              gh api \
+              result=$(gh api \
                 --method PUT \
                 "/repos/${ORG}/.github/contents/profile/README.md" \
-                --field message='chore: add public org profile README' \
-                --field content="${content}" \
-                --jq '"Created: " + .content.path + " (sha: " + .content.sha + ")"'
+                --field message="${message}" \
+                --field content="${content}" 2>&1)
+            fi
+
+            # Validate result
+            if echo "${result}" | jq -e '.content.sha' >/dev/null 2>&1; then
+              new_sha=$(echo "${result}" | jq -r '.content.sha')
+              echo "  ✓ Successfully pushed profile/README.md (sha: ${new_sha:0:7}...)"
+            else
+              echo "  ✗ Failed to push profile/README.md"
+              echo "${result}"
+              exit 1
             fi
           fi
 
