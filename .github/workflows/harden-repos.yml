@@ -39,15 +39,20 @@ jobs:
         id: list_public
         run: |
           echo "=== Current public repositories in ${ORG} ==="
-          gh api "/orgs/${ORG}/repos?type=public&per_page=100" \
-            --paginate \
-            --jq '.[].full_name' \
-            | tee /tmp/public_repos.txt
+          if ! gh api "/orgs/${ORG}/repos?type=public&per_page=100" \
+              --paginate \
+              --jq '.[].full_name' \
+              | tee /tmp/public_repos.txt; then
+            echo "ERROR: Failed to fetch public repositories"
+            exit 1
+          fi
           echo "Total: $(wc -l < /tmp/public_repos.txt) public repos"
 
       - name: Convert public repositories to private
         run: |
           echo "=== Converting public repositories to private (dry_run=${DRY_RUN}) ==="
+          success_count=0
+          error_count=0
 
           while IFS= read -r repo; do
             repo_name="${repo#${ORG}/}"
@@ -60,16 +65,26 @@ jobs:
 
             if [ "${DRY_RUN}" = "true" ]; then
               echo "DRY-RUN: Would set ${repo} to private"
+              success_count=$((success_count + 1))
             else
               echo "Setting ${repo} to private..."
-              gh api \
+              if gh api \
                 --method PATCH \
                 "/repos/${repo}" \
                 --field private=true \
                 --field visibility=private \
-                --jq '"  → " + .full_name + " is now " + .visibility'
+                --jq '"  → " + .full_name + " is now " + .visibility'; then
+                success_count=$((success_count + 1))
+              else
+                echo "  ERROR: Failed to privatize ${repo}"
+                error_count=$((error_count + 1))
+              fi
             fi
           done < /tmp/public_repos.txt
+          
+          echo ""
+          echo "Summary: ${success_count} repositories processed, ${error_count} errors"
+          [ "${error_count}" -gt 0 ] && exit 1 || true
 
       - name: Create STARLIGHTRETAIL/.github if it does not exist
         run: |
@@ -100,12 +115,15 @@ jobs:
             echo "Pushing profile/README.md to ${ORG}/.github..."
 
             # Fetch existing SHA if the file already exists (required for updates)
-            existing_sha=$(
-              gh api "/repos/${ORG}/.github/contents/profile/README.md" \
-                --jq '.sha' 2>/dev/null || true
-            )
+            if existing_sha=$(gh api "/repos/${ORG}/.github/contents/profile/README.md" \
+                --jq '.sha' 2>/dev/null); then
+              echo "File exists, will update (SHA: ${existing_sha})"
+            else
+              echo "File does not exist, will create new file"
+              existing_sha=""
+            fi
 
-            content=$(base64 -w 0 profile/README.md)
+            content=$(base64 < profile/README.md | tr -d '
 
             if [ -n "${existing_sha}" ]; then
               gh api \
@@ -135,9 +153,14 @@ jobs:
 
           echo ""
           echo "--- Public repositories (should only be .github after a real run) ---"
-          gh api "/orgs/${ORG}/repos?type=public&per_page=100" \
-            --paginate \
-            --jq '.[].full_name'
+          public_count=$(gh api "/orgs/${ORG}/repos?type=public&per_page=100" \
+              --paginate \
+              --jq '.[].full_name' | tee /tmp/final_public_repos.txt | wc -l)
+          cat /tmp/final_public_repos.txt
+          echo ""
+          echo "Total public repos: ${public_count}"
+          [ "${DRY_RUN}" = "false" ] && [ "${public_count}" -gt 1 ] && \
+            echo "WARNING: More than 1 public repo detected (expected only .github)" || true
 
           echo ""
           echo "--- STARLIGHTRETAIL/.github visibility ---"
