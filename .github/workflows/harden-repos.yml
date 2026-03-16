@@ -1,0 +1,228 @@
+name: Harden Repository Visibility
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (print actions without applying changes)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+permissions:
+  contents: read
+
+jobs:
+  harden:
+    name: Convert public repos to private and create .github profile repo
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.ORG_ADMIN_PAT }}
+      ORG: STARLIGHTRETAIL
+      DRY_RUN: ${{ inputs.dry_run }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate admin token
+        run: |
+          echo "Validating ORG_ADMIN_PAT permissions..."
+
+          # Check org access
+          gh api /orgs/${ORG} --jq '.login' || {
+            echo "ERROR: ORG_ADMIN_PAT secret is missing or lacks org admin scope."
+            exit 1
+          }
+
+          # Verify token has required scopes (repo and admin:org)
+          scopes=$(gh api /user -i 2>&1 | grep -i "x-oauth-scopes:" | cut -d: -f2- | tr -d ' ')
+          echo "Token scopes: ${scopes}"
+
+          if [[ ! "${scopes}" =~ "repo" ]] || [[ ! "${scopes}" =~ "admin:org" ]]; then
+            echo "ERROR: ORG_ADMIN_PAT must have 'repo' and 'admin:org' scopes"
+            echo "Current scopes: ${scopes}"
+            exit 1
+          fi
+
+          echo "✓ Token validation successful"
+
+      - name: List current public repositories
+        id: list_public
+        run: |
+          echo "=== Current public repositories in ${ORG} ==="
+          if ! gh api "/orgs/${ORG}/repos?type=public&per_page=100" \
+              --paginate \
+              --jq '.[].full_name' \
+              | tee /tmp/public_repos.txt; then
+            echo "ERROR: Failed to fetch public repositories"
+            exit 1
+          fi
+          echo "Total: $(wc -l < /tmp/public_repos.txt) public repos"
+
+      - name: Convert public repositories to private
+        run: |
+          echo "=== Converting public repositories to private (dry_run=${DRY_RUN}) ==="
+
+          total=$(wc -l < /tmp/public_repos.txt)
+          count=0
+          success_count=0
+          skipped_count=0
+          error_count=0
+
+          while IFS= read -r repo; do
+            ((count++))
+            repo_name="${repo#${ORG}/}"
+
+            # The .github repo should remain public (it is the org profile repo)
+            if [ "${repo_name}" = ".github" ]; then
+              echo "[${count}/${total}] SKIP: ${repo} — keeping public (org profile repo)"
+              ((skipped_count++))
+              continue
+            fi
+
+            if [ "${DRY_RUN}" = "true" ]; then
+              echo "[${count}/${total}] DRY-RUN: Would set ${repo} to private"
+              ((success_count++))
+            else
+              echo "[${count}/${total}] Setting ${repo} to private..."
+
+              # Retry logic: attempt up to 3 times with exponential backoff
+              retry=0
+              max_retries=3
+              success=false
+
+              while [ ${retry} -lt ${max_retries} ]; do
+                if gh api \
+                  --method PATCH \
+                  "/repos/${repo}" \
+                  --field private=true \
+                  --field visibility=private \
+                  --jq '"  ✓ " + .full_name + " is now " + .visibility' 2>/dev/null; then
+                  ((success_count++))
+                  success=true
+                  break
+                else
+                  ((retry++))
+                  if [ ${retry} -lt ${max_retries} ]; then
+                    sleep_time=$((2 ** retry))
+                    echo "  ⚠ Retry ${retry}/${max_retries} after ${sleep_time}s..."
+                    sleep ${sleep_time}
+                  fi
+                fi
+              done
+
+              if [ "${success}" = "false" ]; then
+                echo "  ✗ Failed to privatize ${repo} after ${max_retries} attempts"
+                ((error_count++))
+              fi
+            fi
+          done < /tmp/public_repos.txt
+
+          # Summary statistics
+          echo ""
+          echo "=== Conversion Summary ==="
+          echo "Total repos: ${total}"
+          echo "Successfully converted: ${success_count}"
+          echo "Skipped: ${skipped_count}"
+          [ ${error_count} -gt 0 ] && echo "Failed: ${error_count}"
+
+          # Fail the workflow if any repos failed to convert
+          [ "${error_count}" -gt 0 ] && exit 1 || true
+
+      - name: Create STARLIGHTRETAIL/.github if it does not exist
+        run: |
+          if gh api "/repos/${ORG}/.github" --silent 2>/dev/null; then
+            echo ".github repo already exists — skipping creation"
+          else
+            if [ "${DRY_RUN}" = "true" ]; then
+              echo "DRY-RUN: Would create ${ORG}/.github as a public repository"
+            else
+              echo "Creating ${ORG}/.github public repository..."
+              gh api \
+                --method POST \
+                "/orgs/${ORG}/repos" \
+                --field name='.github' \
+                --field description='Public organization profile for Starlight Retail Inc' \
+                --field private=false \
+                --field auto_init=true \
+                --jq '"Created: " + .full_name + " (visibility: " + .visibility + ")"'
+            fi
+          fi
+
+      - name: Push profile/README.md to STARLIGHTRETAIL/.github
+        run: |
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "DRY-RUN: Would push profile/README.md to ${ORG}/.github"
+            echo "--- Content preview (first 10 lines) ---"
+            head -n 10 profile/README.md
+          else
+            echo "Pushing profile/README.md to ${ORG}/.github..."
+
+            # Fetch existing SHA if the file already exists (required for updates)
+            if existing_sha=$(gh api "/repos/${ORG}/.github/contents/profile/README.md" \
+                --jq '.sha' 2>/dev/null); then
+              echo "  → File exists (sha: ${existing_sha:0:7}...), updating..."
+              message='chore: update public org profile README'
+            else
+              echo "  → File does not exist, creating..."
+              existing_sha=""
+              message='chore: add public org profile README'
+            fi
+
+            # Encode content (remove newlines for portability)
+            content=$(base64 < profile/README.md | tr -d '\n')
+
+            # Single PUT operation with conditional SHA
+            if [ -n "${existing_sha}" ]; then
+              result=$(gh api \
+                --method PUT \
+                "/repos/${ORG}/.github/contents/profile/README.md" \
+                --field message="${message}" \
+                --field content="${content}" \
+                --field sha="${existing_sha}" 2>&1)
+            else
+              result=$(gh api \
+                --method PUT \
+                "/repos/${ORG}/.github/contents/profile/README.md" \
+                --field message="${message}" \
+                --field content="${content}" 2>&1)
+            fi
+
+            # Validate result
+            if echo "${result}" | jq -e '.content.sha' >/dev/null 2>&1; then
+              new_sha=$(echo "${result}" | jq -r '.content.sha')
+              echo "  ✓ Successfully pushed profile/README.md (sha: ${new_sha:0:7}...)"
+            else
+              echo "  ✗ Failed to push profile/README.md"
+              echo "${result}"
+              exit 1
+            fi
+          fi
+
+      - name: Validation report
+        run: |
+          echo "=== Post-hardening validation ==="
+
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "DRY-RUN: Showing current state (no changes were applied)"
+          fi
+
+          echo ""
+          echo "--- Public repositories (should only be .github after a real run) ---"
+          public_count=$(gh api "/orgs/${ORG}/repos?type=public&per_page=100" \
+              --paginate \
+              --jq '.[].full_name' | tee /tmp/final_public_repos.txt | wc -l)
+          cat /tmp/final_public_repos.txt
+          echo ""
+          echo "Total public repos: ${public_count}"
+          [ "${DRY_RUN}" = "false" ] && [ "${public_count}" -gt 1 ] && \
+            echo "WARNING: More than 1 public repo detected (expected only .github)" || true
+
+          echo ""
+          echo "--- STARLIGHTRETAIL/.github visibility ---"
+          gh api "/repos/${ORG}/.github" --jq '"Repo: " + .full_name + " | Visibility: " + .visibility' \
+            2>/dev/null || echo "  .github repo does not exist yet"
